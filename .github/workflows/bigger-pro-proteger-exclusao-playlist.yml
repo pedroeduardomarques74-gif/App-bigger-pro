@@ -1,0 +1,233 @@
+name: BIGGER PRO - Proteger Exclusao Playlist
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.github/workflows/bigger-pro-proteger-exclusao-playlist.yml'
+
+jobs:
+  build:
+    name: Gerar APK protegido
+    runs-on: ubuntu-22.04
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Instalar ferramentas Android
+        run: |
+          set -euxo pipefail
+          sudo apt-get update
+          sudo apt-get install -y wget zipalign apksigner
+          wget -q https://github.com/iBotPeaches/Apktool/releases/download/v2.11.1/apktool_2.11.1.jar -O apktool.jar
+          test -s apktool.jar
+
+      - name: Montar APK de origem
+        run: |
+          set -euxo pipefail
+          if [ -f 'BIGGER-PRO-V2 (10).apk' ]; then
+            cp 'BIGGER-PRO-V2 (10).apk' biggerpro.apk
+          elif [ -f biggerpro.apk ]; then
+            cp biggerpro.apk /tmp/biggerpro.apk && cp /tmp/biggerpro.apk biggerpro.apk
+          elif [ -f biggerpro.apk.part00 ] && [ -f biggerpro.apk.part01 ] && [ -f biggerpro.apk.part02 ]; then
+            cat biggerpro.apk.part00 biggerpro.apk.part01 biggerpro.apk.part02 > biggerpro.apk
+          else
+            echo 'APK de origem nao encontrado.'
+            exit 1
+          fi
+          test -s biggerpro.apk
+          ls -lh biggerpro.apk
+
+      - name: Decodificar APK
+        run: |
+          set -euxo pipefail
+          java -jar apktool.jar d -f biggerpro.apk -o decoded
+
+      - name: Aplicar protecao de exclusao
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re, sys
+
+          root = Path('decoded')
+          activity = None
+          model = None
+          for p in root.rglob('ChangePlaylistActivity.smali'):
+              if 'com/flextv/livestore/activities' in str(p).replace('\\','/'):
+                  activity = p
+                  break
+          for p in root.rglob('AppInfoModel$UrlModel.smali'):
+              if 'com/flextv/livestore/models' in str(p).replace('\\','/'):
+                  model = p
+                  break
+
+          if not activity or not model:
+              print('Nao encontrei as classes esperadas.', activity, model)
+              sys.exit(2)
+
+          atxt = activity.read_text(encoding='utf-8', errors='ignore')
+          mtxt = model.read_text(encoding='utf-8', errors='ignore')
+
+          native_sig = re.search(r'(?m)^\.method[^\n]* native deletePlaylist\(Lcom/flextv/livestore/models/AppInfoModel\$UrlModel;\)V\s*$', atxt)
+          if not native_sig:
+              print('Metodo nativo deletePlaylist nao encontrado')
+              sys.exit(3)
+
+          getter = re.search(r'(?m)^\.method[^\n]* getIs_protected\(\)([^\s]+)\s*$', mtxt)
+          if not getter:
+              # fallback: alguns builds usam getPlaylist_protected diretamente no modelo
+              getter = re.search(r'(?m)^\.method[^\n]* getPlaylist_protected\(\)([^\s]+)\s*$', mtxt)
+              getter_name = 'getPlaylist_protected'
+          else:
+              getter_name = 'getIs_protected'
+
+          if not getter:
+              print('Getter de protecao nao encontrado no UrlModel')
+              sys.exit(4)
+
+          ret = getter.group(1)
+          owner = 'Lcom/flextv/livestore/activities/ChangePlaylistActivity;'
+          model_desc = 'Lcom/flextv/livestore/models/AppInfoModel$UrlModel;'
+
+          # Troca somente chamadas ao metodo nativo original. O metodo nativo continua intacto.
+          replaced = 0
+          for p in root.rglob('*.smali'):
+              txt = p.read_text(encoding='utf-8', errors='ignore')
+              new = re.sub(
+                  r'(invoke-direct\s+\{([^}]*)\},\s*Lcom/flextv/livestore/activities/ChangePlaylistActivity;->)deletePlaylist(\(Lcom/flextv/livestore/models/AppInfoModel\$UrlModel;\)V)',
+                  r'\1safeDeletePlaylist\3', txt)
+              if new != txt:
+                  replaced += txt.count('->deletePlaylist(Lcom/flextv/livestore/models/AppInfoModel$UrlModel;)V') - new.count('->deletePlaylist(Lcom/flextv/livestore/models/AppInfoModel$UrlModel;)V')
+                  p.write_text(new, encoding='utf-8')
+
+          if replaced < 1:
+              print('Nenhuma chamada direta ao deletePlaylist foi localizada para substituir.')
+              sys.exit(5)
+
+          if ret == 'Z':
+              body = f'''
+.method private safeDeletePlaylist({model_desc})V
+    .locals 1
+
+    if-eqz p1, :do_delete
+    invoke-virtual {{p1}}, {model_desc}->{getter_name}()Z
+    move-result v0
+    if-nez v0, :blocked
+
+:do_delete
+    invoke-direct {{p0, p1}}, {owner}->deletePlaylist({model_desc})V
+
+:blocked
+    return-void
+.end method
+'''
+          elif ret == 'I':
+              body = f'''
+.method private safeDeletePlaylist({model_desc})V
+    .locals 1
+
+    if-eqz p1, :do_delete
+    invoke-virtual {{p1}}, {model_desc}->{getter_name}()I
+    move-result v0
+    if-nez v0, :blocked
+
+:do_delete
+    invoke-direct {{p0, p1}}, {owner}->deletePlaylist({model_desc})V
+
+:blocked
+    return-void
+.end method
+'''
+          elif ret == 'Ljava/lang/Boolean;':
+              body = f'''
+.method private safeDeletePlaylist({model_desc})V
+    .locals 1
+
+    if-eqz p1, :do_delete
+    invoke-virtual {{p1}}, {model_desc}->{getter_name}()Ljava/lang/Boolean;
+    move-result-object v0
+    if-eqz v0, :do_delete
+    invoke-virtual {{v0}}, Ljava/lang/Boolean;->booleanValue()Z
+    move-result v0
+    if-nez v0, :blocked
+
+:do_delete
+    invoke-direct {{p0, p1}}, {owner}->deletePlaylist({model_desc})V
+
+:blocked
+    return-void
+.end method
+'''
+          elif ret == 'Ljava/lang/String;':
+              body = f'''
+.method private safeDeletePlaylist({model_desc})V
+    .locals 2
+
+    if-eqz p1, :do_delete
+    invoke-virtual {{p1}}, {model_desc}->{getter_name}()Ljava/lang/String;
+    move-result-object v0
+    if-eqz v0, :do_delete
+
+    const-string v1, "1"
+    invoke-virtual {{v1, v0}}, Ljava/lang/String;->equals(Ljava/lang/Object;)Z
+    move-result v1
+    if-nez v1, :blocked
+
+    const-string v1, "true"
+    invoke-virtual {{v1, v0}}, Ljava/lang/String;->equalsIgnoreCase(Ljava/lang/String;)Z
+    move-result v1
+    if-nez v1, :blocked
+
+:do_delete
+    invoke-direct {{p0, p1}}, {owner}->deletePlaylist({model_desc})V
+
+:blocked
+    return-void
+.end method
+'''
+          else:
+              print('Tipo de retorno de protecao nao suportado:', ret)
+              sys.exit(6)
+
+          atxt2 = activity.read_text(encoding='utf-8', errors='ignore')
+          if ' safeDeletePlaylist(' not in atxt2:
+              atxt2 += '\n' + body + '\n'
+              activity.write_text(atxt2, encoding='utf-8')
+
+          print('PATCH OK')
+          print('Activity:', activity)
+          print('Model:', model)
+          print('Getter:', getter_name, 'retorno:', ret)
+          print('Chamadas substituidas:', replaced)
+          PY
+
+      - name: Recompilar APK
+        run: |
+          set -euxo pipefail
+          java -jar apktool.jar b decoded -o unsigned.apk
+          test -s unsigned.apk
+
+      - name: Assinar APK
+        run: |
+          set -euxo pipefail
+          keytool -genkeypair -v -keystore bigger-test.keystore -storepass bigger123 -keypass bigger123 -alias bigger -keyalg RSA -keysize 2048 -validity 10000 -dname 'CN=BIGGER PRO,O=BIGGER,C=BR'
+          zipalign -p -f 4 unsigned.apk aligned.apk
+          apksigner sign --ks bigger-test.keystore --ks-pass pass:bigger123 --key-pass pass:bigger123 --out BIGGER-PRO-EXCLUSAO-PROTEGIDA.apk aligned.apk
+          apksigner verify --verbose BIGGER-PRO-EXCLUSAO-PROTEGIDA.apk
+          ls -lh BIGGER-PRO-EXCLUSAO-PROTEGIDA.apk
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: BIGGER-PRO-EXCLUSAO-PROTEGIDA
+          path: BIGGER-PRO-EXCLUSAO-PROTEGIDA.apk
+          retention-days: 7
