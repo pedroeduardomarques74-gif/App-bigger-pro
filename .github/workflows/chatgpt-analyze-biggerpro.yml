@@ -1,0 +1,121 @@
+name: BIGGER PRO - ChatGPT Analyze APK
+
+on:
+  push:
+    branches: [ chatgpt-local-integration ]
+  workflow_dispatch:
+
+jobs:
+  analyze:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install apktool
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget
+          wget -q https://github.com/iBotPeaches/Apktool/releases/download/v2.11.1/apktool_2.11.1.jar -O apktool.jar
+
+      - name: Reassemble original APK
+        run: |
+          set -euxo pipefail
+          cat biggerpro.apk.part00 biggerpro.apk.part01 biggerpro.apk.part02 > biggerpro.apk
+          test -s biggerpro.apk
+          sha256sum biggerpro.apk | tee apk-sha256.txt
+
+      - name: Decode APK
+        run: |
+          java -jar apktool.jar d -f biggerpro.apk -o decoded
+
+      - name: Analyze panel integration contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re, json, xml.etree.ElementTree as ET
+
+          root=Path('decoded')
+          report=[]
+          manifest=root/'AndroidManifest.xml'
+          mt=manifest.read_text(encoding='utf-8',errors='ignore')
+          report += ['=== MANIFEST ===', mt[:30000], '']
+
+          # Discover package and launcher activity.
+          try:
+              ns={'android':'http://schemas.android.com/apk/res/android'}
+              tree=ET.parse(manifest)
+              r=tree.getroot()
+              pkg=r.attrib.get('package','')
+              report.append(f'PACKAGE={pkg}')
+              for act in r.findall('.//activity'):
+                  name=act.attrib.get('{http://schemas.android.com/apk/res/android}name','')
+                  for fil in act.findall('intent-filter'):
+                      actions=[a.attrib.get('{http://schemas.android.com/apk/res/android}name','') for a in fil.findall('action')]
+                      cats=[c.attrib.get('{http://schemas.android.com/apk/res/android}name','') for c in fil.findall('category')]
+                      if 'android.intent.action.MAIN' in actions and 'android.intent.category.LAUNCHER' in cats:
+                          report.append(f'LAUNCHER={name}')
+          except Exception as e:
+              report.append(f'MANIFEST_PARSE_ERROR={e}')
+
+          smali_files=list(root.glob('smali*/**/*.smali'))
+          needles=[
+              'ibous.epsplay.fun','bigger/api','bigger/img','api.json','APIConnector','ApiRequest','Api.java',
+              'DNSContainer','PopulateDNS','GetMAC','FormatMAC','username','password','mac','expiry','exp_date',
+              'active_cons','status','blocked','ads','background','logo','theme','client','device','version',
+              'SharedPreferences','Realm','player_api.php','get.php'
+          ]
+
+          report += ['','=== RELEVANT SMALI CONTEXTS ===']
+          for f in smali_files:
+              try: lines=f.read_text(encoding='utf-8',errors='ignore').splitlines()
+              except: continue
+              hits=[]
+              for i,line in enumerate(lines):
+                  low=line.lower()
+                  if any(n.lower() in low for n in needles):
+                      hits.append(i)
+              if not hits: continue
+              # Collapse nearby hits.
+              groups=[]
+              for i in hits:
+                  if not groups or i-groups[-1][-1] > 8: groups.append([i])
+                  else: groups[-1].append(i)
+              for g in groups:
+                  a=max(0,g[0]-10); b=min(len(lines),g[-1]+11)
+                  block='\n'.join(f'{j+1}: {lines[j]}' for j in range(a,b))
+                  report += ['',f'--- {f} ---',block]
+
+          # Layout/theme discovery.
+          report += ['','=== HOME/THEME LAYOUTS ===']
+          for p in sorted((root/'res'/'layout').glob('activity_home*.xml')):
+              report.append(str(p))
+              report.append(p.read_text(encoding='utf-8',errors='ignore')[:12000])
+
+          # Assets.
+          report += ['','=== ASSETS ===']
+          assets=root/'assets'
+          if assets.exists():
+              for p in sorted(assets.rglob('*')):
+                  if p.is_file(): report.append(f'{p} size={p.stat().st_size}')
+
+          Path('integration-analysis.txt').write_text('\n'.join(report),encoding='utf-8')
+          print('report bytes',Path('integration-analysis.txt').stat().st_size)
+          PY
+
+      - name: Upload analysis report
+        uses: actions/upload-artifact@v4
+        with:
+          name: BIGGER-PRO-INTEGRATION-ANALYSIS
+          path: |
+            integration-analysis.txt
+            apk-sha256.txt
+          retention-days: 7
