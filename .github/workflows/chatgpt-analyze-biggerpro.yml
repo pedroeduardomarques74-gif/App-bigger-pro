@@ -41,7 +41,7 @@ jobs:
           set -euo pipefail
           python3 - <<'PY'
           from pathlib import Path
-          import re, json, xml.etree.ElementTree as ET
+          import xml.etree.ElementTree as ET
 
           root=Path('decoded')
           report=[]
@@ -49,9 +49,7 @@ jobs:
           mt=manifest.read_text(encoding='utf-8',errors='ignore')
           report += ['=== MANIFEST ===', mt[:30000], '']
 
-          # Discover package and launcher activity.
           try:
-              ns={'android':'http://schemas.android.com/apk/res/android'}
               tree=ET.parse(manifest)
               r=tree.getroot()
               pkg=r.attrib.get('package','')
@@ -81,10 +79,8 @@ jobs:
               hits=[]
               for i,line in enumerate(lines):
                   low=line.lower()
-                  if any(n.lower() in low for n in needles):
-                      hits.append(i)
+                  if any(n.lower() in low for n in needles): hits.append(i)
               if not hits: continue
-              # Collapse nearby hits.
               groups=[]
               for i in hits:
                   if not groups or i-groups[-1][-1] > 8: groups.append([i])
@@ -94,13 +90,10 @@ jobs:
                   block='\n'.join(f'{j+1}: {lines[j]}' for j in range(a,b))
                   report += ['',f'--- {f} ---',block]
 
-          # Layout/theme discovery.
           report += ['','=== HOME/THEME LAYOUTS ===']
           for p in sorted((root/'res'/'layout').glob('activity_home*.xml')):
-              report.append(str(p))
-              report.append(p.read_text(encoding='utf-8',errors='ignore')[:12000])
+              report.append(str(p)); report.append(p.read_text(encoding='utf-8',errors='ignore')[:12000])
 
-          # Assets.
           report += ['','=== ASSETS ===']
           assets=root/'assets'
           if assets.exists():
@@ -108,8 +101,25 @@ jobs:
                   if p.is_file(): report.append(f'{p} size={p.stat().st_size}')
 
           Path('integration-analysis.txt').write_text('\n'.join(report),encoding='utf-8')
-          print('report bytes',Path('integration-analysis.txt').stat().st_size)
           PY
+
+      - name: Prepare decoded integration subset
+        run: |
+          set -euxo pipefail
+          mkdir -p integration-subset/smali integration-subset/res/layout integration-subset/res/xml
+          cp decoded/AndroidManifest.xml integration-subset/
+          cp decoded/res/layout/activity_home*.xml integration-subset/res/layout/ || true
+          cp decoded/res/layout/activity_login*.xml integration-subset/res/layout/ || true
+          cp decoded/res/xml/network_security_config.xml integration-subset/res/xml/ || true
+          find decoded -type f -path '*/com/andyhax/*.smali' -exec cp --parents {} integration-subset/ \;
+          find decoded -type f -path '*/com/andyhax/**/*.smali' -exec cp --parents {} integration-subset/ \;
+          find decoded -type f -path '*/com/StudioLiveCode/**/*.smali' -exec cp --parents {} integration-subset/ \;
+          find decoded -type f -name 'ApiTonny.smali' -exec cp --parents {} integration-subset/ \;
+          find decoded -type f -path '*/com/bumptech/glide/load/engine/Api*.smali' -exec cp --parents {} integration-subset/ \;
+          find decoded -type f -path '*/com/flextv/livestore/activities/HomeActivity*.smali' -exec cp --parents {} integration-subset/ \;
+          find decoded -type f -path '*/com/flextv/livestore/activities/ChangePlaylistActivity*.smali' -exec cp --parents {} integration-subset/ \;
+          find decoded -type f -path '*/com/flextv/livestore/apps/*.smali' -exec cp --parents {} integration-subset/ \;
+          du -sh integration-subset
 
       - name: Upload analysis report
         uses: actions/upload-artifact@v4
@@ -118,4 +128,11 @@ jobs:
           path: |
             integration-analysis.txt
             apk-sha256.txt
+          retention-days: 7
+
+      - name: Upload decoded integration subset
+        uses: actions/upload-artifact@v4
+        with:
+          name: BIGGER-PRO-DECODED-INTEGRATION-SUBSET
+          path: integration-subset
           retention-days: 7
