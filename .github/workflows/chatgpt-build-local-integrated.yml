@@ -1,0 +1,247 @@
+name: BIGGER PRO - Local Integrated APK
+
+on:
+  push:
+    branches: [ chatgpt-local-integration ]
+    paths:
+      - 'chatgpt-local/**'
+      - '.github/workflows/chatgpt-build-local-integrated.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install tools
+        run: |
+          set -eux
+          sudo apt-get update
+          sudo apt-get install -y wget zip unzip
+          wget -q https://github.com/iBotPeaches/Apktool/releases/download/v2.11.1/apktool_2.11.1.jar -O apktool.jar
+
+      - name: Reassemble and decode original APK
+        run: |
+          set -euxo pipefail
+          cat biggerpro.apk.part00 biggerpro.apk.part01 biggerpro.apk.part02 > original.apk
+          sha256sum original.apk | tee original-sha256.txt
+          java -jar apktool.jar d -f original.apk -o decoded
+
+      - name: Patch APK integration points
+        shell: bash
+        run: |
+          set -euxo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+
+          root=Path('decoded')
+
+          def read(p): return p.read_text(encoding='utf-8')
+          def write(p,s): p.write_text(s,encoding='utf-8')
+
+          # 1. Point old panel-controlled web endpoints to the local bridge.
+          p=root/'smali/com/ApiTonny.smali'
+          s=read(p).replace('http://ibous.epsplay.fun/bigger/api/','http://127.0.0.1:8765/bigger/api/')
+          write(p,s)
+
+          # 2. Point visual config/image API to local bridge.
+          p=root/'smali/com/bumptech/glide/load/engine/Api.smali'
+          s=read(p)
+          s=s.replace('http://ibous.epsplay.fun/bigger/img/api.json','http://127.0.0.1:8765/bigger/img/api.json')
+          s=s.replace('http://ibous.epsplay.fun/bigger/img/','http://127.0.0.1:8765/bigger/img/')
+          write(p,s)
+
+          # 3. Make DNSContainer constructible from the Java bridge without JNI.
+          p=root/'smali/com/andyhax/DNSContainer.smali'
+          s=read(p)
+          s=re.sub(r'\.method public native constructor <init>\(\)V\s*\.end method',
+          '''.method public constructor <init>()V
+              .locals 0
+              invoke-direct {p0}, Ljava/lang/Object;-><init>()V
+              return-void
+          .end method''',s,count=1)
+          write(p,s)
+
+          # 4. Start local HTTP/control bridge before visual API fetch.
+          p=root/'smali/com/flextv/livestore/apps/LTVApp.smali'
+          s=read(p)
+          needle='''    invoke-super {p0}, Landroid/app/Application;->onCreate()V
+
+    invoke-direct {p0}, Lcom/flextv/livestore/apps/LTVApp;->setarlayout()V'''
+          repl='''    invoke-super {p0}, Landroid/app/Application;->onCreate()V
+
+    invoke-static {p0}, Lcom/bigger/local/LocalBridge;->start(Landroid/content/Context;)V
+
+    invoke-direct {p0}, Lcom/flextv/livestore/apps/LTVApp;->setarlayout()V'''
+          if needle not in s: raise SystemExit('LTVApp onCreate patch point not found')
+          write(p,s.replace(needle,repl,1))
+
+          # 5. Home layout theme is now controlled directly by panel bridge.
+          p=root/'smali/com/flextv/livestore/activities/HomeActivity.smali'
+          s=read(p)
+          theme_old='''    new-instance v1, Lcom/flextv/livestore/helper/PreferenceHelper;
+
+    invoke-direct {v1, p0}, Lcom/flextv/livestore/helper/PreferenceHelper;-><init>(Landroid/content/Context;)V
+
+    .line 5
+    invoke-virtual {v1}, Lcom/flextv/livestore/helper/PreferenceHelper;->getSharedPreferenceAppInfo()Lcom/flextv/livestore/models/AppInfoModel;
+
+    move-result-object v1
+
+    invoke-virtual {v1}, Lcom/flextv/livestore/models/AppInfoModel;->getTheme()Ljava/lang/String;
+
+    move-result-object v1'''
+          theme_new='''    invoke-static {p0}, Lcom/bigger/local/LocalBridge;->getTheme(Landroid/content/Context;)Ljava/lang/String;
+
+    move-result-object v1'''
+          if theme_old not in s: raise SystemExit('HomeActivity theme patch point not found')
+          s=s.replace(theme_old,theme_new,1)
+          super_call='''    invoke-super {p0, p1}, Lcom/flextv/livestore/apps/BaseActivity;->onCreate(Landroid/os/Bundle;)V
+
+    invoke-static {p0}, Lcom/StudioLiveCode/View/CustomDialog;->showDialog(Landroid/content/Context;)V'''
+          super_new='''    invoke-super {p0, p1}, Lcom/flextv/livestore/apps/BaseActivity;->onCreate(Landroid/os/Bundle;)V
+
+    invoke-static {p0}, Lcom/bigger/local/LocalBridge;->noteLoginSuccess(Landroid/content/Context;)V
+
+    invoke-static {p0}, Lcom/StudioLiveCode/View/CustomDialog;->showDialog(Landroid/content/Context;)V'''
+          if super_call not in s: raise SystemExit('HomeActivity success hook not found')
+          write(p,s.replace(super_call,super_new,1))
+
+          # 6. Block/expiry checks happen before actual Xtream authentication.
+          p=root/'smali/com/andyhax/veeepeeen/ui/login/LoginActivity$5.smali'
+          s=read(p)
+          login_point='''    move-result-object v3
+
+    iget-object v4, p0, Lcom/andyhax/veeepeeen/ui/login/LoginActivity$5;->this$0:Lcom/andyhax/veeepeeen/ui/login/LoginActivity;'''
+          login_new='''    move-result-object v3
+
+    iget-object v5, p0, Lcom/andyhax/veeepeeen/ui/login/LoginActivity$5;->this$0:Lcom/andyhax/veeepeeen/ui/login/LoginActivity;
+
+    invoke-static {v5, v2, v3}, Lcom/bigger/local/LocalBridge;->isLoginAllowed(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;)Z
+
+    move-result v0
+
+    if-nez v0, :bridge_login_allowed
+
+    iget-object v0, p0, Lcom/andyhax/veeepeeen/ui/login/LoginActivity$5;->val$loadingProgressBar:Landroid/widget/ProgressBar;
+
+    const/16 v1, 0x8
+
+    invoke-virtual {v0, v1}, Landroid/view/View;->setVisibility(I)V
+
+    const-string v0, "Acesso bloqueado ou assinatura vencida."
+
+    const/4 v1, 0x1
+
+    invoke-static {v5, v0, v1}, Landroid/widget/Toast;->makeText(Landroid/content/Context;Ljava/lang/CharSequence;I)Landroid/widget/Toast;
+
+    move-result-object v6
+
+    invoke-virtual {v6}, Landroid/widget/Toast;->show()V
+
+    return-void
+
+    :bridge_login_allowed
+    invoke-static {v5, v2, v3}, Lcom/bigger/local/LocalBridge;->noteLoginAttempt(Landroid/content/Context;Ljava/lang/String;Ljava/lang/String;)V
+
+    iget-object v4, p0, Lcom/andyhax/veeepeeen/ui/login/LoginActivity$5;->this$0:Lcom/andyhax/veeepeeen/ui/login/LoginActivity;'''
+          if login_point not in s: raise SystemExit('Login click patch point not found')
+          write(p,s.replace(login_point,login_new,1))
+
+          # 7. Bypass the dead legacy bootstrap activity. LoginActivity becomes launcher.
+          p=root/'AndroidManifest.xml'
+          s=read(p)
+          main_pat=re.compile(r'(<activity[^>]*android:name="com\.andyhax\.MainActivity"[^>]*>).*?(</activity>)',re.S)
+          m=main_pat.search(s)
+          if not m: raise SystemExit('MainActivity manifest block not found')
+          main_open=m.group(1)
+          s=s[:m.start()]+main_open[:-1]+' />'+s[m.end():]
+          login_self=re.search(r'<activity([^>]*android:name="com\.andyhax\.veeepeeen\.ui\.login\.LoginActivity"[^>]*)/>',s)
+          if not login_self: raise SystemExit('LoginActivity manifest entry not found')
+          login_block='<activity'+login_self.group(1)+'>\n            <intent-filter>\n                <action android:name="android.intent.action.MAIN"/>\n                <category android:name="android.intent.category.LEANBACK_LAUNCHER"/>\n                <category android:name="android.intent.category.LAUNCHER"/>\n            </intent-filter>\n        </activity>'
+          s=s[:login_self.start()]+login_block+s[login_self.end():]
+          write(p,s)
+
+          # Smoke asserts.
+          joined='\n'.join(x.read_text(encoding='utf-8',errors='ignore') for x in [root/'smali/com/ApiTonny.smali',root/'smali/com/bumptech/glide/load/engine/Api.smali'])
+          assert 'ibous.epsplay.fun' not in joined
+          assert '127.0.0.1:8765' in joined
+          print('Patch phase OK')
+          PY
+
+      - name: Compile local integration bridge
+        run: |
+          set -euxo pipefail
+          PLATFORM=$(ls -d "$ANDROID_HOME"/platforms/android-* | sort -V | tail -1)
+          BUILD_TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          mkdir -p bridge-classes bridge-dex
+          javac -source 8 -target 8 -cp "$PLATFORM/android.jar" -d bridge-classes chatgpt-local/LocalBridge.java
+          "$BUILD_TOOLS/d8" --lib "$PLATFORM/android.jar" --min-api 21 --output bridge-dex bridge-classes/com/bigger/local/LocalBridge*.class
+          test -s bridge-dex/classes.dex
+          strings bridge-dex/classes.dex | grep -q 'com/bigger/local/LocalBridge'
+
+      - name: Rebuild patched APK
+        run: |
+          set -euxo pipefail
+          java -jar apktool.jar b decoded -o unsigned-base.apk
+          cp bridge-dex/classes.dex classes4.dex
+          zip -q unsigned-base.apk classes4.dex
+          unzip -l unsigned-base.apk | grep -q 'classes4.dex'
+
+      - name: Align and sign
+        run: |
+          set -euxo pipefail
+          BUILD_TOOLS=$(ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1)
+          keytool -genkeypair -v -keystore local-test.keystore -storepass bigger123 -keypass bigger123 -alias biggerlocal -keyalg RSA -keysize 2048 -validity 10000 -dname 'CN=BIGGER LOCAL TEST,O=Grupo Bigger,C=BR'
+          "$BUILD_TOOLS/zipalign" -f -p 4 unsigned-base.apk BIGGER-PRO-LOCAL-INTEGRADO-UNSIGNED.apk
+          "$BUILD_TOOLS/apksigner" sign --ks local-test.keystore --ks-key-alias biggerlocal --ks-pass pass:bigger123 --key-pass pass:bigger123 --out BIGGER-PRO-LOCAL-INTEGRADO.apk BIGGER-PRO-LOCAL-INTEGRADO-UNSIGNED.apk
+          "$BUILD_TOOLS/apksigner" verify --verbose --print-certs BIGGER-PRO-LOCAL-INTEGRADO.apk | tee signature-report.txt
+          sha256sum BIGGER-PRO-LOCAL-INTEGRADO.apk | tee integrated-sha256.txt
+
+      - name: Static integration smoke tests
+        run: |
+          set -euxo pipefail
+          rm -rf verify
+          java -jar apktool.jar d -f --no-src BIGGER-PRO-LOCAL-INTEGRADO.apk -o verify
+          grep -q 'com.andyhax.veeepeeen.ui.login.LoginActivity' verify/AndroidManifest.xml
+          unzip -l BIGGER-PRO-LOCAL-INTEGRADO.apk | grep -q 'classes4.dex'
+          unzip -p BIGGER-PRO-LOCAL-INTEGRADO.apk classes4.dex | strings | grep -q '127.0.0.1'
+          grep -R -q '127.0.0.1:8765/bigger/api/' decoded/smali/com/ApiTonny.smali
+          grep -R -q '127.0.0.1:8765/bigger/img/api.json' decoded/smali/com/bumptech/glide/load/engine/Api.smali
+          cat > INTEGRATION-TEST-REPORT.txt <<'EOF'
+          BIGGER PRO LOCAL INTEGRATION
+          - Original APK reconstructed and decoded: OK
+          - Legacy panel web endpoints redirected to local bridge: OK
+          - Visual config endpoint redirected to local bridge: OK
+          - Local bridge compiled into classes4.dex: OK
+          - Application starts local bridge: OK
+          - Login launcher bypasses dead legacy bootstrap: OK
+          - DNS populated from panel state: implemented
+          - Client block/expiry pre-login enforcement: implemented
+          - Successful Home entry reported back to panel state: implemented
+          - Theme 1-5 read from panel state at HomeActivity creation: implemented
+          - Ads 1/2/3, entry message, warning message served locally: implemented
+          - APK signature verification: OK
+          - Re-decode smoke test: OK
+          NOTE: IPTV streams/login still require network access to the DNS/server configured by the user.
+          EOF
+
+      - name: Upload integrated APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: BIGGER-PRO-LOCAL-INTEGRADO
+          path: |
+            BIGGER-PRO-LOCAL-INTEGRADO.apk
+            INTEGRATION-TEST-REPORT.txt
+            integrated-sha256.txt
+            signature-report.txt
+          retention-days: 7
